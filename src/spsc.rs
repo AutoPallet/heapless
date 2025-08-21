@@ -120,7 +120,7 @@ pub struct Queue<T, const N: usize> {
 impl<T, const N: usize> Queue<T, N> {
     const INIT: UnsafeCell<MaybeUninit<T>> = UnsafeCell::new(MaybeUninit::uninit());
 
-    #[inline]
+    #[inline(always)]
     fn increment(val: usize) -> usize {
         (val + 1) % N
     }
@@ -191,6 +191,12 @@ impl<T, const N: usize> Queue<T, N> {
         unsafe { self.inner_enqueue(val) }
     }
 
+    /// Version of `enqueue` that is fully inlined.
+    #[inline(always)]
+    pub fn enqueue_inline(&mut self, val: T) -> Result<(), T> {
+        unsafe { self.inner_enqueue_inline(val) }
+    }
+
     /// Returns the item in the front of the queue, or `None` if the queue is empty
     #[inline]
     pub fn dequeue(&mut self) -> Option<T> {
@@ -221,21 +227,36 @@ impl<T, const N: usize> Queue<T, N> {
         }
     }
 
+    unsafe fn inner_enqueue(&self, val: T) -> Result<(), T> {
+        unsafe { self.inner_enqueue_inline(val) }
+    }
+
     // The memory for enqueueing is "owned" by the tail pointer.
     // NOTE: This internal function uses internal mutability to allow the [`Producer`] to enqueue
     // items without doing pointer arithmetic and accessing internal fields of this type.
-    unsafe fn inner_enqueue(&self, val: T) -> Result<(), T> {
+    #[inline(always)]
+    unsafe fn inner_enqueue_inline(&self, val: T) -> Result<(), T> {
         let current_tail = self.tail.load(Ordering::Relaxed);
         let next_tail = Self::increment(current_tail);
 
-        if next_tail != self.head.load(Ordering::Acquire) {
-            (self.buffer.get_unchecked(current_tail).get()).write(MaybeUninit::new(val));
-            self.tail.store(next_tail, Ordering::Release);
-
-            Ok(())
-        } else {
-            Err(val)
+        if next_tail == self.head.load(Ordering::Acquire){
+            return Err(val);
         }
+
+        // NOTE(will): (AutoPallet fork): Avoid indexing and pointer arithmetic, which introduce
+        // non-inlined function calls to precondition checks when debug assertions are enabled.
+
+        // base pointer into the MaybeUninit<T> array
+        let base: *const UnsafeCell<MaybeUninit<T>> = self.buffer.as_ptr();
+        let elem_size = core::mem::size_of::<T>();
+        // compute slot pointer within slice indexing or ptr::add/offset
+        let slot: *const UnsafeCell<MaybeUninit<T>> = ((base as usize).wrapping_add((current_tail as usize).wrapping_mul(elem_size))) as *const _;
+        // store with no helpers
+        ptr::write_volatile((*slot).get(), MaybeUninit::new(val));
+
+        self.tail.store(next_tail, Ordering::Release);
+
+        Ok(())
     }
 
     // The memory for enqueueing is "owned" by the tail pointer.
